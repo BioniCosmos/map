@@ -1,4 +1,3 @@
-use bit_set::BitSet;
 use std::{
     hash::{BuildHasher, Hash, RandomState},
     iter, mem,
@@ -97,20 +96,19 @@ impl<K: Hash + Eq, V> Map<K, V> {
         let mut i = group_index;
         loop {
             let ctrl = &self.ctrl[i];
-            let (matches, found_empty) = ctrl.find_h2(h2);
-            for ctrl_index in &matches {
+            let (mut matches, found_empty) = ctrl.find_h2(h2);
+            while matches != 0 {
+                let ctrl_index = matches.trailing_zeros() as usize;
                 let slot_index = self.get_slot_index(i, ctrl_index);
-                if let Some(entry) = self.slots[slot_index].as_ref() {
+                if let Some(entry) = &self.slots[slot_index] {
                     if entry.key == *key {
                         return Some(slot_index);
                     }
                 }
-            }
-            if found_empty {
-                return None;
+                matches &= matches - 1;
             }
             i = (i + 1) % self.group_count;
-            if i == group_index {
+            if found_empty || i == group_index {
                 return None;
             }
         }
@@ -181,28 +179,49 @@ impl Ctrl {
         Self(u64::from_ne_bytes([Self::SLOT_EMPTY; 8]))
     }
 
-    fn find_h2(self, h2: u8) -> (BitSet, bool) {
-        let mut matches = BitSet::with_capacity(GROUP_SIZE);
-        for i in 0..GROUP_SIZE {
-            let c = (self.0 >> (i * 8)) as u8;
-            if c == Self::SLOT_EMPTY {
-                return (matches, true);
-            }
-            if c == h2 {
-                matches.insert(i);
-            }
+    fn find_h2(self, h2: u8) -> (u8, bool) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        unsafe {
+            (self.match_byte(h2), self.match_byte(Self::SLOT_EMPTY) != 0)
         }
-        (matches, false)
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+        {
+            let mut matches = 0;
+            for i in 0..GROUP_SIZE {
+                let c = (self.0 >> (i * 8)) as u8;
+                if c == Self::SLOT_EMPTY {
+                    return (matches, true);
+                }
+                if c == h2 {
+                    matches |= 1 << i;
+                }
+            }
+            (matches, false)
+        }
     }
 
     fn find_empty_and_deleted(self) -> Option<usize> {
-        for i in 0..GROUP_SIZE {
-            let c = (self.0 >> (i * 8)) as u8;
-            if c == Self::SLOT_EMPTY || c == Self::SLOT_DELETED {
-                return Some(i);
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        unsafe {
+            let matches = self.match_empty_or_deleted();
+            if matches != 0 {
+                Some(matches.trailing_zeros() as usize)
+            } else {
+                None
             }
         }
-        None
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+        {
+            for i in 0..GROUP_SIZE {
+                let c = (self.0 >> (i * 8)) as u8;
+                if c == Self::SLOT_EMPTY || c == Self::SLOT_DELETED {
+                    return Some(i);
+                }
+            }
+            None
+        }
     }
 
     fn set(&mut self, i: usize, slot: Slot) {
@@ -213,6 +232,30 @@ impl Ctrl {
         let clear_mask = !((0xff as u64) << (i * 8));
         self.0 &= clear_mask;
         self.0 |= (c as u64) << (i * 8);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn match_byte(self, byte: u8) -> u8 {
+        use std::arch::x86_64::*;
+        unsafe {
+            let targets = _mm_set1_epi8(byte as i8);
+            let controls = _mm_loadl_epi64(&self.0 as *const u64 as *const __m128i);
+            let cmp = _mm_cmpeq_epi8(controls, targets);
+            _mm_movemask_epi8(cmp) as u8
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn match_empty_or_deleted(self) -> u8 {
+        use std::arch::x86_64::*;
+        unsafe {
+            let controls = _mm_loadl_epi64(&self.0 as *const u64 as *const __m128i);
+            _mm_movemask_epi8(controls) as u8
+        }
     }
 }
 
@@ -435,5 +478,78 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_collision_stress() {
+        let mut map = Map::new();
+        let n = if cfg!(miri) { 100 } else { 10000 };
+
+        for i in 0..n {
+            map.insert(i, i);
+        }
+
+        for i in 0..n {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+
+        for i in (0..n).step_by(2) {
+            assert_eq!(map.delete(&i), Some(i));
+        }
+
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), None);
+            } else {
+                assert_eq!(map.get(&i), Some(&i));
+            }
+        }
+
+        for i in (0..n).step_by(2) {
+            map.insert(i, i * 2);
+        }
+
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), Some(&(i * 2)));
+            } else {
+                assert_eq!(map.get(&i), Some(&i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_high_load_delete_reinsert() {
+        let mut map = Map::new();
+        let n = 1000;
+
+        // Fill the map to a high load factor
+        for i in 0..n {
+            map.insert(i, i);
+        }
+
+        // Delete a large portion of the items
+        for i in (0..n).step_by(2) {
+            assert_eq!(map.delete(&i), Some(i));
+        }
+
+        // Check that the remaining items are still there
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.get(&i), None);
+            } else {
+                assert_eq!(map.get(&i), Some(&i));
+            }
+        }
+
+        // Re-insert all items, some will be new, some will overwrite tombstones
+        for i in 0..n {
+            map.insert(i, i * 10);
+        }
+
+        // Check that all items are present with their new values
+        for i in 0..n {
+            assert_eq!(map.get(&i), Some(&(i * 10)));
+        }
     }
 }

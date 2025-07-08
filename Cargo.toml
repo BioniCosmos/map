@@ -3,9 +3,6 @@ name = "map"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-bit-set = "0.8"
-
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
 
