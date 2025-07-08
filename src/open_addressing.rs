@@ -61,10 +61,22 @@ impl<K: Hash + Eq, V> Map<K, V> {
         Some(&mut self.slots[i].as_mut().unwrap().value)
     }
 
+    pub fn contains(&self, key: &K) -> bool {
+        self.find_index(key).is_some()
+    }
+
     pub fn delete(&mut self, key: &K) -> Option<V> {
         let i = self.find_index(key)?;
         self.count -= 1;
         Some(self.slots[i].delete().value)
+    }
+
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter { map: self, i: 0 }
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut { map: self, i: 0 }
     }
 
     fn find_index(&self, key: &K) -> Option<usize> {
@@ -152,6 +164,76 @@ impl<T> Slot<T> {
 
     fn is_occupied(&self) -> bool {
         matches!(self, Self::Occupied(_))
+    }
+}
+
+pub struct Iter<'a, K: Hash + Eq, V> {
+    map: &'a Map<K, V>,
+    i: usize,
+}
+
+impl<'a, K: Hash + Eq, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.i < self.map.slots.len() {
+            if let Slot::Occupied(entry) = &self.map.slots[self.i] {
+                self.i += 1;
+                return Some((&entry.key, &entry.value));
+            }
+            self.i += 1;
+        }
+        None
+    }
+}
+
+pub struct IterMut<'a, K: Hash + Eq, V> {
+    map: &'a mut Map<K, V>,
+    i: usize,
+}
+
+impl<'a, K: Hash + Eq, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.i < self.map.slots.len() {
+            if let Slot::Occupied(entry) = &mut self.map.slots[self.i] {
+                self.i += 1;
+                let entry: *mut Entry<K, V> = entry;
+                return Some(unsafe { (&(*entry).key, &mut (*entry).value) });
+            }
+            self.i += 1;
+        }
+        None
+    }
+}
+
+pub struct IntoIter<K: Hash + Eq, V> {
+    map: Map<K, V>,
+    i: usize,
+}
+
+impl<K: Hash + Eq, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.i < self.map.slots.len() {
+            if let Slot::Occupied(entry) = mem::replace(&mut self.map.slots[self.i], Slot::Empty) {
+                self.i += 1;
+                return Some((entry.key, entry.value));
+            }
+            self.i += 1;
+        }
+        None
+    }
+}
+
+impl<K: Hash + Eq, V> IntoIterator for Map<K, V> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { map: self, i: 0 }
     }
 }
 
@@ -322,5 +404,61 @@ mod tests {
         assert_eq!(map.insert(100, 100), None);
         assert_eq!(map.get(&100), Some(&100));
         assert_eq!(map.count, 7);
+    }
+
+    #[test]
+    fn test_contains() {
+        let mut map = Map::new();
+        map.insert("a".to_string(), 1);
+        assert!(map.contains(&"a".to_string()));
+        assert!(!map.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_iter() {
+        let mut map = Map::new();
+        map.insert("a".to_string(), 1);
+        map.insert("b".to_string(), 2);
+        let mut std_map = StdHashMap::new();
+        std_map.insert("a".to_string(), 1);
+        std_map.insert("b".to_string(), 2);
+
+        let mut count = 0;
+        for (k, v) in map.iter() {
+            assert_eq!(std_map.get(k), Some(v));
+            count += 1;
+        }
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_iter_mut() {
+        let mut map = Map::new();
+        map.insert("a".to_string(), 1);
+        map.insert("b".to_string(), 2);
+
+        for (_, v) in map.iter_mut() {
+            *v *= 2;
+        }
+
+        assert_eq!(map.get(&"a".to_string()), Some(&2));
+        assert_eq!(map.get(&"b".to_string()), Some(&4));
+    }
+
+    #[test]
+    fn test_into_iter() {
+        let mut map = Map::new();
+        map.insert("a".to_string(), 1);
+        map.insert("b".to_string(), 2);
+        let mut std_map = StdHashMap::new();
+        std_map.insert("a".to_string(), 1);
+        std_map.insert("b".to_string(), 2);
+
+        let mut count = 0;
+        for (k, v) in map.into_iter() {
+            assert_eq!(std_map.get(&k), Some(&v));
+            count += 1;
+        }
+        assert_eq!(count, 2);
     }
 }
