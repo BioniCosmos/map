@@ -1,3 +1,4 @@
+use bit_set::BitSet;
 use std::{
     hash::{BuildHasher, Hash, RandomState},
     iter, mem,
@@ -17,7 +18,7 @@ struct Entry<K, V> {
 }
 
 #[derive(Copy, Clone)]
-struct Ctrl([u8; 8]);
+struct Ctrl(u64);
 
 enum Slot {
     Deleted,
@@ -97,7 +98,7 @@ impl<K: Hash + Eq, V> Map<K, V> {
         loop {
             let ctrl = &self.ctrl[i];
             let (matches, found_empty) = ctrl.find_h2(h2);
-            for ctrl_index in matches {
+            for ctrl_index in &matches {
                 let slot_index = self.get_slot_index(i, ctrl_index);
                 if let Some(entry) = self.slots[slot_index].as_ref() {
                     if entry.key == *key {
@@ -177,24 +178,26 @@ impl Ctrl {
     const SLOT_DELETED: u8 = 0b1111_1110;
 
     const fn new() -> Self {
-        Self([Self::SLOT_EMPTY; GROUP_SIZE])
+        Self(u64::from_ne_bytes([Self::SLOT_EMPTY; 8]))
     }
 
-    fn find_h2(self, h2: u8) -> (Vec<usize>, bool) {
-        let mut matches = Vec::new();
-        for (i, &c) in self.0.iter().enumerate() {
+    fn find_h2(self, h2: u8) -> (BitSet, bool) {
+        let mut matches = BitSet::with_capacity(GROUP_SIZE);
+        for i in 0..GROUP_SIZE {
+            let c = (self.0 >> (i * 8)) as u8;
             if c == Self::SLOT_EMPTY {
                 return (matches, true);
             }
             if c == h2 {
-                matches.push(i);
+                matches.insert(i);
             }
         }
         (matches, false)
     }
 
     fn find_empty_and_deleted(self) -> Option<usize> {
-        for (i, &c) in self.0.iter().enumerate() {
+        for i in 0..GROUP_SIZE {
+            let c = (self.0 >> (i * 8)) as u8;
             if c == Self::SLOT_EMPTY || c == Self::SLOT_DELETED {
                 return Some(i);
             }
@@ -203,10 +206,13 @@ impl Ctrl {
     }
 
     fn set(&mut self, i: usize, slot: Slot) {
-        self.0[i] = match slot {
+        let c = match slot {
             Slot::Deleted => Self::SLOT_DELETED,
             Slot::Occupied(h2) => h2,
-        }
+        };
+        let clear_mask = !((0xff as u64) << (i * 8));
+        self.0 &= clear_mask;
+        self.0 |= (c as u64) << (i * 8);
     }
 }
 
