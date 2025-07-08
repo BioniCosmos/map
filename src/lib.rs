@@ -1,3 +1,5 @@
+pub mod swiss;
+
 use std::{
     hash::{BuildHasher, Hash, RandomState},
     iter, mem,
